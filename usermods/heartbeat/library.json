@@ -1,0 +1,7 @@
+{
+  "name": "heartbeat",
+  "build": { "libArchive": false },
+  "dependencies": {
+    "sparkfun/SparkFun MAX3010x Pulse and Proximity Sensor Library": "^1.1.2"
+  }
+}

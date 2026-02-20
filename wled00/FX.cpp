@@ -127,6 +127,15 @@ static um_data_t* getAudioData() {
   return um_data;
 }
 
+// returns heartbeat sensor data, or nullptr if sensor not available
+static um_data_t* getHeartbeatData() {
+  um_data_t *um_data;
+  if (!UsermodManager::getUMData(&um_data, USERMOD_ID_HEARTBEAT)) {
+    return nullptr;
+  }
+  return um_data;
+}
+
 
 // effect functions
 
@@ -4105,10 +4114,17 @@ static const char _data_FX_MODE_PERCENT[] PROGMEM = "Percent@!,% of fill,,,,One 
 
 /*
  * Modulates the brightness similar to a heartbeat
- * (unimplemented?) tries to draw an ECG approximation on a 2D matrix
+ * Uses real BPM from heartbeat sensor usermod when available,
+ * otherwise falls back to speed slider.
  */
 void mode_heartbeat(void) {
   unsigned bpm = 40 + (SEGMENT.speed >> 3);
+  // override with real sensor BPM if available
+  um_data_t *hb_data = getHeartbeatData();
+  if (hb_data) {
+    uint8_t sensorBpm = *(uint8_t*)hb_data->u_data[0];
+    if (sensorBpm > 0) bpm = sensorBpm;
+  }
   uint32_t msPerBeat = (60000L / bpm);
   uint32_t secondBeat = (msPerBeat / 3);
   uint32_t bri_lower = SEGENV.aux1;
@@ -4132,6 +4148,107 @@ void mode_heartbeat(void) {
   }
 }
 static const char _data_FX_MODE_HEARTBEAT[] PROGMEM = "Heartbeat@!,!;!,!;!;01;m12=1";
+
+
+/*
+ * Heartbeat Pulse: flash on each real heartbeat with exponential decay.
+ * Uses sensor data when available, falls back to speed slider BPM.
+ * Produces a lub-dub pattern (primary beat + secondary beat at 1/3 interval).
+ */
+void mode_heartbeat_pulse(void) {
+  if (SEGLEN <= 1) return mode_static();
+
+  // get BPM: prefer sensor, fall back to speed slider
+  unsigned bpm = 40 + (SEGMENT.speed >> 3);
+  uint16_t sensorIbi = 0;
+  uint8_t  sensorBeat = 0;
+
+  um_data_t *hb_data = getHeartbeatData();
+  if (hb_data) {
+    uint8_t sensorBpm = *(uint8_t*)hb_data->u_data[0];
+    sensorBeat        = *(uint8_t*)hb_data->u_data[1];
+    sensorIbi         = *(uint16_t*)hb_data->u_data[2];
+    if (sensorBpm > 0) bpm = sensorBpm;
+  }
+
+  uint32_t msPerBeat = sensorIbi > 0 ? sensorIbi : (60000UL / bpm);
+  uint32_t secondBeat = msPerBeat / 3;
+  uint32_t bri_lower = SEGENV.aux1;
+  unsigned long beatTimer = strip.now - SEGENV.step;
+
+  // exponential decay between beats, rate controlled by intensity slider
+  bri_lower = bri_lower * 2042 / (2048 + SEGMENT.intensity);
+  SEGENV.aux1 = bri_lower;
+
+  if (sensorBeat) {
+    // real beat detected from sensor — primary beat
+    SEGENV.aux1 = UINT16_MAX;
+    SEGENV.aux0 = 0;
+    SEGENV.step = strip.now;
+  } else if (!hb_data || (hb_data && *(uint8_t*)hb_data->u_data[0] == 0)) {
+    // no sensor or no finger: use timer-based fallback
+    if ((beatTimer > secondBeat) && !SEGENV.aux0) {
+      SEGENV.aux1 = UINT16_MAX * 3 / 4; // secondary beat (softer)
+      SEGENV.aux0 = 1;
+    }
+    if (beatTimer > msPerBeat) {
+      SEGENV.aux1 = UINT16_MAX;
+      SEGENV.aux0 = 0;
+      SEGENV.step = strip.now;
+    }
+  } else {
+    // sensor active but between beats: trigger secondary beat at 1/3 interval
+    if ((beatTimer > secondBeat) && !SEGENV.aux0) {
+      SEGENV.aux1 = UINT16_MAX * 3 / 4;
+      SEGENV.aux0 = 1;
+    }
+  }
+
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    SEGMENT.setPixelColor(i, color_blend(SEGMENT.color_from_palette(i, true, PALETTE_SOLID_WRAP, 0), SEGCOLOR(1), uint8_t(255 - (SEGENV.aux1 >> 8))));
+  }
+}
+static const char _data_FX_MODE_HEARTBEAT_PULSE[] PROGMEM = "Heartbeat Pulse@BPM (fallback),Decay;!,!;!;01;m12=1";
+
+
+/*
+ * Heartbeat Breath: smooth sinusoidal brightness cycle synced to heartbeat.
+ * Period matches the inter-beat interval from sensor.
+ * Falls back to speed slider timing when no sensor is present.
+ */
+void mode_heartbeat_breath(void) {
+  if (SEGLEN <= 1) return mode_static();
+
+  // determine cycle period
+  uint32_t period;
+  um_data_t *hb_data = getHeartbeatData();
+  if (hb_data) {
+    uint8_t sensorBpm  = *(uint8_t*)hb_data->u_data[0];
+    uint16_t sensorIbi = *(uint16_t*)hb_data->u_data[2];
+    if (sensorBpm > 0 && sensorIbi > 0) {
+      period = sensorIbi;
+    } else {
+      // no finger — use slider
+      period = 60000UL / (40 + (SEGMENT.speed >> 3));
+    }
+  } else {
+    // no sensor compiled in — use slider
+    period = 60000UL / (40 + (SEGMENT.speed >> 3));
+  }
+
+  // calculate sine phase from current time within the period
+  uint16_t phase = (uint16_t)((strip.now % period) * 65535UL / period);
+  uint16_t sinVal = sin16_t(phase); // 0-65535
+
+  // map intensity slider to minimum brightness (depth of breath)
+  uint8_t minBri = SEGMENT.intensity; // 0 = full range, 255 = barely changes
+  uint8_t bri = minBri + (uint8_t)(((255 - minBri) * (uint32_t)sinVal) >> 16);
+
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    SEGMENT.setPixelColor(i, color_blend(SEGCOLOR(1), SEGMENT.color_from_palette(i, true, PALETTE_SOLID_WRAP, 0), bri));
+  }
+}
+static const char _data_FX_MODE_HEARTBEAT_BREATH[] PROGMEM = "Heartbeat Breath@BPM (fallback),Depth;!,!;!;01;m12=1";
 
 
 //  "Pacifica"
@@ -10880,6 +10997,9 @@ void WS2812FX::setupEffectData() {
   addEffect(FX_MODE_TV_SIMULATOR, &mode_tv_simulator, _data_FX_MODE_TV_SIMULATOR);
   addEffect(FX_MODE_DYNAMIC_SMOOTH, &mode_dynamic_smooth, _data_FX_MODE_DYNAMIC_SMOOTH);
   addEffect(FX_MODE_PACMAN, &mode_pacman, _data_FX_MODE_PACMAN);
+  // --- 1D heartbeat-synced effects ---
+  addEffect(FX_MODE_HEARTBEAT_PULSE, &mode_heartbeat_pulse, _data_FX_MODE_HEARTBEAT_PULSE);
+  addEffect(FX_MODE_HEARTBEAT_BREATH, &mode_heartbeat_breath, _data_FX_MODE_HEARTBEAT_BREATH);
 
   // --- 1D audio effects ---
   addEffect(FX_MODE_PIXELS, &mode_pixels, _data_FX_MODE_PIXELS);
