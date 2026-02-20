@@ -40,6 +40,8 @@ private:
   void initSensor() {
     if (sdaPin >= 0 && sclPin >= 0) {
       Wire.begin(sdaPin, sclPin);
+    } else {
+      Wire.begin(); // use board default I2C pins
     }
 
     sensorFound = particleSensor.begin(Wire, I2C_SPEED_FAST);
